@@ -1,0 +1,550 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from timm.models.layers import trunc_normal_
+
+from corr_nmrf.utils.frame_utils import InputPadder
+from corr_nmrf.config import configurable
+from corr_nmrf.models.backbone import create_backbone
+from corr_nmrf.models.DPN import DPN
+from corr_nmrf.models.submodule import build_correlation_volume
+from corr_nmrf.models.NMP import (
+    MLP,
+    InferenceLayer,
+    Inference,
+    RefinementLayer,
+    Refinement,
+)
+
+
+class CorrNMRF(nn.Module):
+    @configurable
+    def __init__(self,
+                 backbone,
+                 dpn,
+                 num_proposals,
+                 min_disp,
+                 max_disp,
+                 num_infer_layers,
+                 num_refine_layers,
+                 infer_embed_dim,
+                 infer_n_heads,
+                 mlp_ratio,
+                 window_size,
+                 refine_window_size,
+                 nmp_type="swin",
+                 refine_nmp_type="swin",
+                 ttt_rank=8,
+                 ttt_base_lr=1.0,
+                 ttt_mini_batch_size=16,
+                 ttt_max_chunks=32,
+                 ttt_hard_token_ratio=0.5,
+                 ttt_use_spatial_fusion=True,
+                 ttt_fusion_kernels=(1, 3, 5),
+                 ttt_dropout=0.0,
+                 ttt_use_diag=True,
+                 ttt_target_mode="epipolar",
+                 ttt_stop_grad_target=True,
+                 ttt_use_confidence_weight=True,
+                 ttt_use_residual=True,
+                 ttt_epipolar_target_style="split_ln",
+                 ttt_corr_lambda=0.5,
+                 ttt_loss_type="smooth_l1",
+                 ttt_smooth_l1_beta=1.0,
+                 ttt_router_loss_weight_conf=True,
+                 with_refinement=True,
+                 attn_drop=0.,
+                 proj_drop=0.,
+                 drop_path=0.,
+                 dropout=0.,
+                 return_intermediate=False,
+                 normalize_before=False,
+                 activation="gelu",
+                 aux_loss=False,
+                 divis_by=8,
+                 compat=True):
+        """
+        aux_loss: True if auxiliary intermediate losses (losses at each encoder/decoder layer)
+        """
+        super().__init__()
+        self.num_proposals = num_proposals
+        self.min_disp = min_disp
+        self.max_disp = max_disp
+        self.aux_loss = aux_loss
+        self.divis_by = divis_by
+
+        feat_dim = backbone.output_dim
+
+        self.concatconv = nn.Sequential(
+            nn.Conv2d(feat_dim, 128, 3, 1, 1, bias=False),
+            nn.InstanceNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 64, 1, 1, 0, bias=False))
+        self.gw = nn.Sequential(
+            nn.Conv2d(feat_dim, 128, 3, 1, 1, bias=False),
+            nn.InstanceNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, 1, 1, 0, bias=False))
+
+        # stochastic depth
+        dpr = [x.item() for x in torch.linspace(0, drop_path, num_infer_layers)]
+        infer_layers = nn.ModuleList([
+            InferenceLayer(
+                infer_embed_dim, mlp_ratio=mlp_ratio, window_size=window_size,
+                shift_size=0 if i % 2 == 0 else window_size // 2, n_heads=infer_n_heads,
+                activation=activation,
+                attn_drop=attn_drop, proj_drop=proj_drop, drop_path=dpr[i], dropout=dropout,
+                normalize_before=normalize_before,
+                nmp_type=nmp_type,
+                ttt_rank=ttt_rank,
+                ttt_base_lr=ttt_base_lr,
+                ttt_mini_batch_size=ttt_mini_batch_size,
+                ttt_max_chunks=ttt_max_chunks,
+                ttt_hard_token_ratio=ttt_hard_token_ratio,
+                ttt_use_spatial_fusion=ttt_use_spatial_fusion,
+                ttt_fusion_kernels=ttt_fusion_kernels,
+                ttt_dropout=ttt_dropout,
+                ttt_use_diag=ttt_use_diag,
+                ttt_target_mode=ttt_target_mode,
+                ttt_stop_grad_target=ttt_stop_grad_target,
+                ttt_use_confidence_weight=ttt_use_confidence_weight,
+                ttt_use_residual=ttt_use_residual,
+                ttt_epipolar_target_style=ttt_epipolar_target_style,
+                ttt_corr_lambda=ttt_corr_lambda,
+                ttt_loss_type=ttt_loss_type,
+                ttt_smooth_l1_beta=ttt_smooth_l1_beta,
+                ttt_router_loss_weight_conf=ttt_router_loss_weight_conf,
+                cost_group=32,
+            )
+            for i in range(num_infer_layers)]
+        )
+        infer_norm = nn.LayerNorm(infer_embed_dim)
+        self.inference = Inference(32, infer_embed_dim, layers=infer_layers, norm=infer_norm,
+                                   return_intermediate=return_intermediate)
+        self.infer_head = MLP(infer_embed_dim, infer_embed_dim, 8 * 8, 3)
+        self.infer_score_head = nn.Linear(infer_embed_dim, 8 * 8)
+
+        # init weights
+        self.apply(self._init_weights)
+
+        self.with_refinement = with_refinement
+        if self.with_refinement:
+            # refinement
+            dpr = [x.item() for x in torch.linspace(0, drop_path, num_refine_layers)]
+            refine_layers = nn.ModuleList([
+                RefinementLayer(
+                    infer_embed_dim, mlp_ratio=mlp_ratio, window_size=refine_window_size,
+                    shift_size=0 if i % 2 == 0 else refine_window_size // 2, n_heads=infer_n_heads,
+                    activation=activation,
+                    attn_drop=attn_drop, proj_drop=proj_drop, drop_path=dpr[i], dropout=dropout,
+                    normalize_before=normalize_before,
+                    nmp_type=refine_nmp_type,
+                    ttt_rank=ttt_rank,
+                    ttt_base_lr=ttt_base_lr,
+                    ttt_mini_batch_size=ttt_mini_batch_size,
+                    ttt_max_chunks=ttt_max_chunks,
+                    ttt_hard_token_ratio=ttt_hard_token_ratio,
+                    ttt_use_spatial_fusion=ttt_use_spatial_fusion,
+                    ttt_fusion_kernels=ttt_fusion_kernels,
+                    ttt_dropout=ttt_dropout,
+                    ttt_use_diag=ttt_use_diag,
+                    ttt_target_mode=ttt_target_mode,
+                    ttt_stop_grad_target=ttt_stop_grad_target,
+                    ttt_use_confidence_weight=ttt_use_confidence_weight,
+                    ttt_use_residual=ttt_use_residual,
+                    ttt_epipolar_target_style=ttt_epipolar_target_style,
+                    ttt_corr_lambda=ttt_corr_lambda,
+                    ttt_loss_type=ttt_loss_type,
+                    ttt_smooth_l1_beta=ttt_smooth_l1_beta,
+                    ttt_router_loss_weight_conf=ttt_router_loss_weight_conf,
+                    cost_group=32,
+                )
+                for i in range(num_refine_layers)]
+            )
+            refine_norm = nn.LayerNorm(infer_embed_dim)
+            self.refinement = Refinement(32, infer_embed_dim, layers=refine_layers, norm=refine_norm,
+                                       return_intermediate=return_intermediate)
+            self.refine_head = MLP(infer_embed_dim, infer_embed_dim, 4 * 4, 3)
+
+        self.dpn = dpn
+        # backward compatible with the models released at CVPR'24
+        self.compat = compat
+        if compat:
+            self.backbone = backbone
+        else:
+            self.image_encoder = backbone
+
+        # to keep track of which device the nn.Module is on
+        self.register_buffer("device_indicator_tensor", torch.empty(0))
+
+    def freeze_bn(self):
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+    @classmethod
+    def from_config(cls, cfg):
+        # backbone
+        backbone = create_backbone(cfg)
+
+        # disparity proposal network
+        dpn = DPN(cfg)
+
+        return {
+            "backbone": backbone,
+            "dpn": dpn,
+            "num_proposals": cfg.DPN.NUM_PROPOSALS,
+            "min_disp": cfg.DPN.MIN_DISP,
+            "max_disp": cfg.DPN.MAX_DISP,
+            "aux_loss": cfg.SOLVER.AUX_LOSS,
+            "num_infer_layers": cfg.NMP.NUM_INFER_LAYERS,
+            "num_refine_layers": cfg.NMP.NUM_REFINE_LAYERS,
+            "infer_embed_dim": cfg.NMP.INFER_EMBED_DIM,
+            "infer_n_heads": cfg.NMP.INFER_N_HEADS,
+            "mlp_ratio": cfg.NMP.MLP_RATIO,
+            "window_size": cfg.NMP.WINDOW_SIZE,
+            "refine_window_size": cfg.NMP.REFINE_WINDOW_SIZE,
+            "nmp_type": cfg.NMP.NMP_TYPE,
+            "refine_nmp_type": cfg.NMP.REFINE_NMP_TYPE,
+            "ttt_rank": cfg.NMP.TTT_RANK,
+            "ttt_base_lr": cfg.NMP.TTT_BASE_LR,
+            "ttt_mini_batch_size": cfg.NMP.TTT_MINI_BATCH_SIZE,
+            "ttt_max_chunks": cfg.NMP.TTT_MAX_CHUNKS,
+            "ttt_hard_token_ratio": cfg.NMP.TTT_HARD_TOKEN_RATIO,
+            "ttt_use_spatial_fusion": cfg.NMP.TTT_USE_SPATIAL_FUSION,
+            "ttt_fusion_kernels": tuple(cfg.NMP.TTT_FUSION_KERNELS),
+            "ttt_dropout": cfg.NMP.TTT_DROPOUT,
+            "ttt_use_diag": cfg.NMP.TTT_USE_DIAG,
+            "ttt_target_mode": cfg.NMP.TTT_TARGET_MODE,
+            "ttt_stop_grad_target": cfg.NMP.TTT_STOP_GRAD_TARGET,
+            "ttt_use_confidence_weight": cfg.NMP.TTT_USE_CONFIDENCE_WEIGHT,
+            "ttt_use_residual": cfg.NMP.TTT_USE_RESIDUAL,
+            "ttt_epipolar_target_style": cfg.NMP.TTT_EPIPOLAR_TARGET_STYLE,
+            "ttt_corr_lambda": cfg.NMP.TTT_CORR_LAMBDA,
+            "ttt_loss_type": cfg.NMP.TTT_LOSS_TYPE,
+            "ttt_smooth_l1_beta": cfg.NMP.TTT_SMOOTH_L1_BETA,
+            "ttt_router_loss_weight_conf": cfg.NMP.TTT_ROUTER_LOSS_WEIGHT_CONF,
+            "attn_drop": cfg.NMP.ATTN_DROP,
+            "proj_drop": cfg.NMP.PROJ_DROP,
+            "drop_path": cfg.NMP.DROP_PATH,
+            "dropout": cfg.NMP.DROPOUT,
+            "normalize_before": cfg.NMP.NORMALIZE_BEFORE,
+            "return_intermediate": cfg.NMP.RETURN_INTERMEDIATE,
+            "divis_by": cfg.DATASETS.DIVIS_BY,
+            "compat": cfg.BACKBONE.COMPAT,
+        }
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        elif isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (nn.LayerNorm, nn.InstanceNorm2d)):
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+            if m.weight is not None:
+                nn.init.constant_(m.weight, 1.0)
+
+    @property
+    def device(self):
+        """Returns the device that the model is on."""
+        return self.device_indicator_tensor.device
+
+    def extract_feature(self, img1, img2):
+        img_batch = torch.cat((img1, img2), dim=0)  # [2B, C, H, W]
+        if self.compat:
+            features = self.backbone(img_batch)
+        else:
+            features = self.image_encoder(img_batch)  # list of [2B, C, H, W], resolution from high to low
+
+        # reverse resolution from low to high
+        features = features[::-1]
+
+        # split to list of tuple, res from low to high
+        features = [torch.chunk(feature, 2, dim=0) for feature in features]
+
+        feature1, feature2 = map(list, zip(*features))
+
+        return feature1, feature2
+
+    def forward(self, sample):
+        """
+        It returns a dict with the following elements:
+            - "proposal": disparity proposals, tensor of dim [n, B*H/2*W/2, num_proposals]
+            - "prob": disparity candidate probability, tensor of dim [B*H/2*W/2, W/2]
+            - "initial_proposal": disparity proposals from initialization stage, tensor of dim [B*H/2*W/2, num_proposals]
+            - "disp": disparity prediction, tensor of dim [B, H, W]
+            - "aux_outputs": Optional, only returned when auxiliary losses are activated. It is a list of
+                             dictionaries containing the four above keys for each intermediate layer.
+        """
+        image1 = sample['img1'].to(self.device)
+        image2 = sample['img2'].to(self.device)
+
+        # We assume the input padding is not needed during training by setting adequate crop size
+        if not self.training:
+            padder = InputPadder(image1.shape, mode='proposal', divis_by=self.divis_by)
+            image1, image2 = padder.pad(image1, image2)
+        fmap1_list, fmap2_list = self.extract_feature(image1, image2)
+        coarse_min_disp = self.min_disp // 8
+        coarse_max_disp = self.max_disp // 8
+        cost_volume = build_correlation_volume(
+            fmap1_list[0], fmap2_list[0], coarse_max_disp, self.dpn.cost_group, mindisp=coarse_min_disp
+        )  # [B,G,D,H,W]
+        cost_volume, prob, label_seeds, labels = self.dpn(cost_volume, fmap1_list)
+        # DPN runs in index domain [0, D); shift it back to absolute disparity (coarse scale).
+        disp_offset = float(coarse_min_disp)
+        label_seeds = label_seeds.float() + disp_offset
+        labels = labels + disp_offset
+
+        # ---- Corr-NMRF inference ---- #
+        fmap1 = self.concatconv(fmap1_list[0])
+        fmap2 = self.concatconv(fmap2_list[0])
+        fmap1_gw = self.gw(fmap1_list[0])
+        fmap2_gw = self.gw(fmap2_list[0])
+        labels_curr = labels[-1].detach()
+
+        tgt = self.inference(labels_curr, fmap1, fmap2, fmap1_gw, fmap2_gw)
+        disp_delta = self.infer_head(tgt)  # [num_aux_layers,BHW,N,8*8]
+        coarse_disp = labels_curr[None].unsqueeze(-1) + disp_delta
+        mask = .25 * self.infer_score_head(tgt)  # [num_aux_layers,BHW,N,8*8]
+        bs, _, ht, wd = fmap1.shape
+        coarse_disp = rearrange(coarse_disp, 'a (b h w) n (hs ws) -> a b (h hs) (w ws) n', h=ht, w=wd, hs=8).contiguous()
+        mask = rearrange(mask, 'a (b h w) n (hs ws) -> a b (h hs) (w ws) n', h=ht, w=wd, hs=8)
+
+        disp_pred = None
+        if self.with_refinement:
+            # refinement
+            _, indices = torch.max(mask[-1], dim=-1, keepdim=True)
+            disp_curr = torch.gather(coarse_disp[-1], dim=-1, index=indices).squeeze(-1) * 2  # [B,H,W]
+            disp_curr = rearrange(disp_curr, 'b (h hs) (w ws) -> b h w (hs ws)', hs=4, ws=4)
+            disp_curr = torch.median(disp_curr, dim=-1, keepdim=False)[0]
+            disp_curr = disp_curr.detach()
+            fmap1 = self.concatconv(fmap1_list[1])
+            fmap2 = self.concatconv(fmap2_list[1])
+            fmap1_gw = self.gw(fmap1_list[1])
+            fmap2_gw = self.gw(fmap2_list[1])
+            tgt = self.refinement(disp_curr, fmap1, fmap2, fmap1_gw, fmap2_gw)
+            disp_delta = self.refine_head(tgt)  # [num_aux_layers,BHW,4*4]
+            bs, _, ht, wd = fmap1.shape
+            disp_delta = rearrange(disp_delta, 'a (b h w) p -> a b h w p', h=ht, w=wd)
+            disp_pred = disp_curr[None].unsqueeze(-1) + disp_delta
+            disp_pred = rearrange(disp_pred, 'a b h w (hs ws) -> a b (h hs) (w ws)', hs=4).contiguous()
+
+        if disp_pred is not None:
+            disp = disp_pred[-1] * 4
+        else:
+            _, indices = torch.max(mask[-1], dim=-1, keepdim=True)
+            disp = torch.gather(coarse_disp[-1], dim=-1, index=indices).squeeze(-1) * 8  # [B,H,W]
+
+        if not self.training:
+            disp = padder.unpad(disp.unsqueeze(1)).squeeze(1)
+
+        bs = image1.shape[0]
+        label_seeds = label_seeds.reshape(bs, -1, self.num_proposals)
+        proposal = labels[-1].reshape(bs, -1, self.num_proposals)
+        out = {'proposal': proposal, 'prob': prob, 'initial_proposal': label_seeds, 'disp': disp}
+        if disp_pred is not None:
+            out['disp_pred'] = disp_pred[-1]
+        if self.aux_loss and self.training:
+            out['aux_outputs'] = self._set_aux_loss(disp_pred, coarse_disp, mask)
+
+        return out
+
+    @torch.jit.unused
+    def _set_aux_loss(self, disp_pred, coarse_disp, logits_pred):
+        res = []
+        for coarse_disp_i, logits_pred_i in zip(coarse_disp, logits_pred):
+            res.append(dict(disp_pred=coarse_disp_i, logits_pred=logits_pred_i))
+        if disp_pred is None:
+            return res
+        for disp_pred_i in disp_pred[:-1]:
+            res.append(dict(disp_pred=disp_pred_i))
+        return res
+
+
+class Criterion(nn.Module):
+    """ This class computes the loss for disparity proposal extraction.
+    The process happens in two steps:
+        1) we compute a one-to-one matching between ground truth disparities and the outputs of the model
+        2) we supervise each output to be closer to the ground truth disparity it was matched to
+
+    Note: to avoid trivial solution, we add a prior term in the loss computation that we favor positive output.
+    """
+    def __init__(self, weight_dict, cfg):
+        """ Create the criterion.
+        Parameters:
+            weight_dict: dict containing as key the names of the losses and as values their relative weight.
+        """
+        super().__init__()
+        if cfg.SOLVER.AUX_LOSS:
+            # TODO
+            pass
+        self.weight_dict = weight_dict
+        self.min_disp = cfg.SOLVER.MIN_DISP
+        self.max_disp = cfg.SOLVER.MAX_DISP
+        assert cfg.SOLVER.LOSS_TYPE in ['L1', 'SMOOTH_L1'], f"unrecognized loss type {cfg.SOLVER.LOSS_TYPE}"
+        if cfg.SOLVER.LOSS_TYPE == "SMOOTH_L1":
+            self.loss_fn = F.smooth_l1_loss
+        else:
+            self.loss_fn = F.l1_loss
+
+    def _valid_disp_mask(self, disp):
+        return (disp >= self.min_disp) & (disp < self.max_disp)
+
+    def loss_prop(self, disp_prop, gt_disp):
+        """
+        disp_prop: [B,hw,N]
+        gt_disp: [B,H,W], where H=8*h, W=8*w
+        """
+        tgt_disp = gt_disp.clone()
+        # ground truth modes larger than 320 are ignored in following matching
+        tgt_disp[~self._valid_disp_mask(tgt_disp)] = 0
+        tgt_disp = rearrange(tgt_disp, 'b (h m) (w n) -> b (h w) (m n)', m=8, n=8)
+        dist = (tgt_disp[:, :, :, None] - disp_prop[:, :, None, :]).abs()
+        _, indices = torch.min(dist, dim=-1, keepdim=False)
+        src_disp = torch.gather(disp_prop, dim=-1, index=indices)
+    
+        mask = self._valid_disp_mask(tgt_disp)
+        if not torch.any(mask):
+            dummy = F.smooth_l1_loss(disp_prop, disp_prop.detach(), reduction='mean')
+            return {'loss_prop': dummy}
+        total_gts = torch.sum(mask)
+        # disparity loss for matched predictions
+        loss_disp = F.smooth_l1_loss(src_disp[mask], tgt_disp[mask], reduction='sum')
+        losses = {'loss_prop': loss_disp / (total_gts + 1e-6)}
+    
+        return losses
+
+    def loss_init(self, prob, gt_disp):
+        nd = prob.shape[-1]
+        bs, ht, wd = gt_disp.shape
+        valid = self._valid_disp_mask(gt_disp)
+
+        ref = torch.arange(0, wd, dtype=torch.int64, device=prob.device).reshape(1, 1, -1).repeat(bs, ht, 1)
+        coord = ref - gt_disp  # corresponding coordinate in the right view
+        valid = torch.logical_and(valid, coord >= 0)  # correspondence should within image boundary
+
+        # scale ground-truth disparities
+        coarse_disp = gt_disp / 8.0
+        disp_offset = float(self.min_disp // 8)
+        tgt_disp = coarse_disp - disp_offset
+
+        weights = torch.ones_like(tgt_disp)
+        weights[~valid] = 0
+
+        tgt_disp = rearrange(tgt_disp, 'b (h m) (w n) -> (b h w) (m n)', m=8, n=8)
+        weights = rearrange(weights, 'b (h m) (w n) -> (b h w) (m n)', m=8, n=8)
+        valid = rearrange(valid, 'b (h m) (w n) -> (b h w) (m n)', m=8, n=8)
+
+        lower_bound = torch.floor(tgt_disp).to(torch.int64)
+        high_bound = lower_bound + 1
+        high_prob = tgt_disp - lower_bound
+        lower_bound = torch.clamp(lower_bound, min=0, max=nd - 1)
+        high_bound = torch.clamp(high_bound, min=0, max=nd - 1)
+
+        lower_prob = (1 - high_prob) * weights
+        high_prob = high_prob * weights
+
+        label = torch.zeros_like(prob)
+        label.scatter_reduce_(dim=-1, index=lower_bound, src=lower_prob, reduce="sum")
+        label.scatter_reduce_(dim=-1, index=high_bound, src=high_prob, reduce="sum")
+
+        # normalize weights
+        normalizer = torch.clamp(torch.sum(label, dim=-1, keepdim=True), min=1e-3)
+        label = label / normalizer
+
+        mask = label > 0
+        if not torch.any(mask):
+            dummy = F.smooth_l1_loss(prob, prob.detach(), reduction='mean')
+            return {'init': dummy}
+        log_prob = -(torch.log(torch.clamp(prob[mask], min=1e-6)) * label[mask]).sum()
+        valid_pixs = (valid.float().sum(dim=-1) > 0).sum()
+
+        losses = {'init': log_prob / (valid_pixs + 1e-6)}
+        assert not torch.any(torch.isnan(losses['init']))
+        return losses
+
+    def loss_coarse(self, disp_pred, logits_pred, disp_gt):
+        mask = self._valid_disp_mask(disp_gt)
+        prob = F.softmax(logits_pred, dim=-1)
+        disp_gt = disp_gt.unsqueeze(-1).expand_as(disp_pred)
+        error = self.loss_fn(disp_pred, disp_gt, reduction='none')
+        if torch.any(mask):
+            loss = torch.sum(prob * error, dim=-1, keepdim=False)[mask].mean()
+        else:  # dummy loss
+            loss = F.smooth_l1_loss(disp_pred, disp_pred.detach(), reduction='mean') + F.smooth_l1_loss(logits_pred, logits_pred.detach(), reduction='mean')
+        return {"loss_coarse_disp": loss}
+
+    def loss_disp(self, disp_pred, disp_gt):
+        mask = self._valid_disp_mask(disp_gt)
+        if torch.any(mask):
+            loss = self.loss_fn(disp_pred[mask], disp_gt[mask], reduction='mean')
+        else:
+            loss = F.smooth_l1_loss(disp_pred, disp_pred.detach(), reduction='mean')
+        return {"loss_disp": loss}
+
+    def forward(self, outputs, targets, log=True):
+        """This performs the loss computation.
+        outputs: dict of tensors, see the output specification of the model for the format
+        targets: dict of tensors, the expected keys in each dict depends on the losses applied.
+            - "disp": [batch_size, H_I, W_I],
+            - "occlusion_map": boolean tensor [batch_size, H_I, W] occlusion map of left image,
+            - "occlusion_map_2": boolean tensor [batch_size, H_I, W] occlusion map of right image.
+        """
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+
+        prob = outputs_without_aux['prob']  # [B*H*W,D]
+        disp_prop = outputs_without_aux['proposal'] * 8  # [B,H*W,N]
+        disp = outputs_without_aux['disp']
+        device = disp.device
+
+        tgt_disp = targets['disp'].to(device)
+        valid = targets['valid'].to(device)
+        tgt_disp[~valid] = 0
+
+        losses = self.loss_prop(disp_prop, tgt_disp)
+        losses.update(self.loss_init(prob, tgt_disp))
+        if 'disp_pred' in outputs_without_aux:
+            disp_pred = outputs_without_aux['disp_pred'] * 4
+            losses.update(self.loss_disp(disp_pred, tgt_disp))
+        if log:
+            valid = self._valid_disp_mask(tgt_disp)
+            err = torch.abs(disp - tgt_disp)
+            losses['epe_train'] = err[valid].mean()
+
+        # In case of auxiliary losses, we repeat this process with the output of each intermediate layer
+        if 'aux_outputs' in outputs:
+            for i, aux_outputs in enumerate(outputs['aux_outputs']):
+                if 'logits_pred' in aux_outputs:
+                    disp_pred = aux_outputs['disp_pred'] * 8
+                    logits_pred = aux_outputs['logits_pred']
+                    l_dict = self.loss_coarse(disp_pred, logits_pred, tgt_disp)
+                else:
+                    disp_pred = aux_outputs['disp_pred'] * 4
+                    l_dict = self.loss_disp(disp_pred, tgt_disp)
+                l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
+                losses.update(l_dict)
+
+        return losses
+
+
+def build(cfg):
+    model = CorrNMRF(cfg)
+    # Keep key names aligned with Criterion.forward() outputs.
+    weight_dict = {'loss_prop': 1, 'init': 1}
+    assert len(cfg.SOLVER.LOSS_WEIGHTS) == cfg.NMP.NUM_INFER_LAYERS + cfg.NMP.NUM_REFINE_LAYERS
+    if cfg.SOLVER.AUX_LOSS:
+        aux_weight_dict = {}
+        for i in range(cfg.NMP.NUM_INFER_LAYERS + cfg.NMP.NUM_REFINE_LAYERS-1):
+            if i < cfg.NMP.NUM_INFER_LAYERS:
+                aux_weight_dict.update({f'loss_coarse_disp_{i}': cfg.SOLVER.LOSS_WEIGHTS[i]})
+            else:
+                aux_weight_dict.update({f'loss_disp_{i}': cfg.SOLVER.LOSS_WEIGHTS[i]})
+        weight_dict.update(aux_weight_dict)
+    weight_dict.update({'loss_disp': cfg.SOLVER.LOSS_WEIGHTS[-1]})
+    criterion = Criterion(weight_dict, cfg)
+
+    return model, criterion
